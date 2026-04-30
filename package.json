@@ -1,0 +1,39 @@
+{
+  "name": "clawd",
+  "version": "2.0.0",
+  "description": "Claude-Code-parity agentic coding system — multi-agent planner with OSS model support",
+  "type": "module",
+  "main": "dist/cli.js",
+  "bin": {
+    "clawd": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/cli.js serve",
+    "dev": "tsx watch src/cli.ts serve",
+    "plan": "tsx src/cli.ts plan",
+    "chat": "tsx src/cli.ts chat",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@mariozechner/pi-agent-core": "latest",
+    "@mariozechner/pi-ai": "latest",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "croner": "^8.0.0",
+    "fast-glob": "^3.3.2",
+    "glob": "^11.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/which": "^3.0.4",
+    "commander": "^14.0.3",
+    "gray-matter": "^4.0.3",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0",
+    "vscode-languageserver-protocol": "^3.17.5",
+    "which": "^6.0.1"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
