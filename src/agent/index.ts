@@ -9,9 +9,21 @@ export {
   findTemplate,
   findDefinition,
 }                                                                                       from "./discovery.js";
+export { AgentMailbox }                                                                 from "./mailbox.js";
+export type { AgentEnvelope }                                                           from "./mailbox.js";
+export { AgentRegistry }                                                                from "./agent-registry.js";
+export type { ManagedAgent, AgentStatus }                                               from "./agent-registry.js";
+export { findSystemDef, loadSystemDef, resolveAgentFolder }                             from "./system-def.js";
 export type {
-  AgentTemplate,
-  AgentDefinition,
-  AgentDiscoveryResult,
-}                                                                                       from "./discovery.js";
-export type { AgentConfig, AgentTool, AgentToolSet, PromptOptions, AgentRoleDefinition } from "./types.js";
+  SystemDefinition,
+  SystemAgentDef,
+  SystemRoute,
+  AgentRole,
+}                                                                                       from "./system-def.js";
+export type {
+  AgentConfig,
+  AgentTool,
+  AgentToolSet,
+  PromptOptions,
+  AgentRoleDefinition,
+}                                                                                       from "./types.js";
