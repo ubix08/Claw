@@ -60,6 +60,7 @@ import { installSkill, HUB_REGISTRY }             from "../skills-install.js";
 import matter                                     from "gray-matter";
 
 import type { Agent }                             from "../agent/agent.js";
+import type { AgentRegistry }                     from "../agent/agent-registry.js";
 import type { AgentEvent }                        from "../core/types.js";
 import type { Channel }                           from "./channel.js";
 import type { GlobalConfig }                      from "../config.js";
@@ -76,11 +77,13 @@ interface ParsedRequest {
 export class ApiChannel implements Channel {
   readonly id   = "api";
   readonly name = "HTTP API";
-  private _server: http.Server | null = null;
-  private _agent:  Agent | null = null;
+  private _server:   http.Server | null = null;
+  private _agent:    Agent | null = null;
+  private _registry: AgentRegistry | null = null;
 
-  async run(agent: Agent | null): Promise<void> {
+  async run(agent: Agent | null, registry?: AgentRegistry): Promise<void> {
     this._agent = agent;
+    this._registry = registry ?? null;
 
     // [API-FIX-2] Fresh config on every request — reload here for port/host.
     const config = loadConfig();
