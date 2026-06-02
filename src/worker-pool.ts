@@ -2,25 +2,29 @@
 // worker-pool.ts — Manages worker agent lifecycle per step
 // ============================================================
 //
-// Each step in the plan is executed by a worker agent running
-// in a scoped context.  The WorkerPool:
+// REFACTORED: Uses pi-agent-core Agent with full tool schemas
+// instead of primitive bash-block regex extraction.
 //
-//   1. Builds a minimal system prompt for the worker's role
-//   2. Calls the LLM in a CodeAct-style bash-first loop
-//   3. Injects recovery prompts on contract failure
-//   4. Returns a StepResult for the orchestrator to record
+// Each step executes a pi-agent-core Agent instance with:
+//   - Role-specific system prompt
+//   - Coding tool set (read, write, edit, bash, glob, grep, LSP, etc.)
+//   - TypeBox-validated tool_use/tool_result cycle
+//   - Surface 2 context injection (NOTES.md on every turn)
+//   - Contract verification after the worker completes
+//   - Recovery prompt + retry on contract failure
 //
 // Workers never share context across steps — each invocation
 // starts from the step brief + prior artifacts only.
-//
-// The "bash-first" principle from the spec is enforced via the
-// worker system prompt which de-emphasises structured tool calls.
 // ============================================================
 
 import * as fs from "fs/promises";
 import * as path from "path";
-import { exec } from "child_process";
-import { promisify } from "util";
+
+import { Agent as PiAgent } from "@mariozechner/pi-agent-core";
+import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import type { Message } from "@mariozechner/pi-ai";
+import type { AgentTool } from "./agent/types.js";
+
 import {
   PlanStep,
   StepResult,
@@ -28,9 +32,10 @@ import {
   VerificationResult,
 } from "./types.js";
 import { ContractVerifier } from "./contract-verifier.js";
-import { callLLM, Message } from "./llm-client.js";
-
-const execAsync = promisify(exec);
+import { resolveModel } from "./core/model-resolver.js";
+import { createCoreTools } from "./tools/index.js";
+import { logger } from "./core/logger.js";
+import { PermissionManager } from "./core/permissions.js";
 
 // ─── Worker system prompts per role ──────────────────────────
 
@@ -39,7 +44,7 @@ const ROLE_PROMPTS: Record<PlanStep["worker"], string> = {
 You are a code explorer agent. Your job is to read and understand the codebase within your scope, then write findings to EXPLORATION.md (or a filename specified in your brief).
 
 RULES:
-- ALWAYS prefer bash for reading files: use cat, grep, find, tree.
+- Use the read tool to examine files. Use glob and grep for search.
 - Do NOT write any source code. You are a reader only.
 - Write your NOTES.md scratchpad BEFORE writing the final output file.
 - Be exhaustive: document every relevant function signature, route, type, and dependency you find.
@@ -51,7 +56,7 @@ You are a coder agent. Your job is to implement the code change described in you
 RULES:
 - Read NOTES.md (if it exists) and any files referenced in your brief FIRST.
 - Write to NOTES.md before touching source files — plan before acting.
-- ALWAYS prefer bash for file operations: cat, mkdir, mv, cp.
+- Use the read, write, edit, and bash tools as needed.
 - After every file write, run the relevant compiler/linter (tsc --noEmit, eslint, etc.) and fix errors immediately.
 - Do NOT refactor code outside your declared scope.
 - Do NOT declare success if the compiler reports errors.
@@ -59,13 +64,13 @@ RULES:
 ANTI-PATTERNS (never do these):
 - Do NOT rewrite an entire file when you need to change one function.
 - Do NOT ignore type errors and move on.
-- Do NOT use structured tool calls for things bash can do.`,
+- Do NOT use bash for what write/edit tools can do.`,
 
   tester: `\
 You are a test-writing agent. Your job is to write tests for the code change described in your brief.
 
 RULES:
-- Read the implementation files in your scope FIRST via bash (cat, grep).
+- Read the implementation files in your scope FIRST via the read tool.
 - Write to NOTES.md your test plan before writing tests.
 - After writing tests, run them (npm test, pytest, go test, etc.) and fix failures.
 - Tests must be deterministic — no random data, no network calls without mocking.
@@ -105,47 +110,56 @@ ATTEMPT ${attempt} INSTRUCTIONS:
 - After your fix, re-run the verification command to confirm it passes.`;
 }
 
+// ─── Helper: split "provider/model" string ─────────────────────
+
+function splitModelString(s: string, defaultProvider: string): { provider: string; model: string } {
+  const i = s.indexOf("/");
+  if (i > 0) return { provider: s.slice(0, i), model: s.slice(i + 1) };
+  return { provider: defaultProvider, model: s };
+}
+
 // ─── WorkerPool ──────────────────────────────────────────────
 
 export class WorkerPool {
   private readonly verifier: ContractVerifier;
+  private readonly permissions: PermissionManager;
+  private _toolCache: AgentTool[] | null = null;
 
   constructor(
     private readonly config: WorkerConfig,
     private readonly roleModels: Partial<Record<PlanStep["worker"], string>> = {}
   ) {
+    this.permissions = new PermissionManager(); // headless — auto-allow all
     this.verifier = new ContractVerifier(
-      // Verifier uses the cheapest available model
       this.roleModels.verifier ?? config.model,
       config.workspaceRoot
     );
   }
 
   async executeStep(step: PlanStep): Promise<StepResult> {
-    const model = step.model ?? this.roleModels[step.worker] ?? this.config.model;
+    const modelStr = step.model ?? this.roleModels[step.worker] ?? this.config.model;
+    const { provider, model } = splitModelString(modelStr, this.config.provider);
     const workerWorkspace = await this.prepareWorkerWorkspace(step);
 
     let lastVerification: VerificationResult | null = null;
     let attempt = 0;
-    const messages: Message[] = [this.buildInitialUserMessage(step, workerWorkspace)];
+    let lastOutput = "";
 
     while (attempt < this.config.maxRetries) {
       attempt++;
-      console.log(`[WorkerPool] Step ${step.id} attempt ${attempt}/${this.config.maxRetries}`);
+      logger.info(`[WorkerPool] Step ${step.id} attempt ${attempt}/${this.config.maxRetries}`);
 
-      // ── Run the worker ─────────────────────────────────────
-      const agentResponse = await this.runWorkerTurns(
+      // ── Run the worker via pi-agent-core Agent ────────────────
+      const agentOutput = await this.runWorkerAgent(
+        provider,
         model,
-        step.worker,
-        messages,
+        step,
         workerWorkspace,
-        step
+        attempt > 1 ? lastVerification : null
       );
+      lastOutput = agentOutput;
 
-      // Append agent response to history for context in retries
-      messages.push({ role: "assistant", content: agentResponse });
-
-      // ── Verify the contract ────────────────────────────────
+      // ── Verify the contract ──────────────────────────────────
       lastVerification = await this.verifier.verify(
         step.output_contract,
         step.scope
@@ -163,18 +177,7 @@ export class WorkerPool {
         };
       }
 
-      // ── Inject recovery prompt ─────────────────────────────
-      if (attempt < this.config.maxRetries) {
-        messages.push({
-          role: "user",
-          content: buildRecoveryPrompt(
-            step.output_contract.description,
-            lastVerification.reason,
-            lastVerification.evidence,
-            attempt + 1
-          ),
-        });
-      }
+      logger.info(`[WorkerPool] Step ${step.id} contract not met: ${lastVerification.reason}`);
     }
 
     // All retries exhausted
@@ -182,125 +185,123 @@ export class WorkerPool {
       stepId: step.id,
       status: "fail",
       attempts: attempt,
-      evidence: lastVerification?.evidence ?? "",
+      evidence: lastVerification?.evidence ?? lastOutput.slice(0, 2000),
       artifacts: [],
       failureReason: lastVerification?.reason ?? "Max retries exceeded",
     };
     await this.writeStepResult(
-      step.id,
-      "fail",
-      attempt,
-      lastVerification?.evidence ?? "",
-      [],
+      step.id, "fail", attempt,
+      lastVerification?.evidence ?? "", [],
       lastVerification?.reason
     );
     return failResult;
   }
 
-  // ─── Worker turn loop ─────────────────────────────────────────
+  // ─── Worker Agent (pi-agent-core) ────────────────────────────
 
-  private async runWorkerTurns(
-    model: string,
-    role: PlanStep["worker"],
-    messages: Message[],
+  private async runWorkerAgent(
+    provider: string,
+    modelId: string,
+    step: PlanStep,
     workerWorkspace: string,
-    step: PlanStep
+    previousFailure: VerificationResult | null,
   ): Promise<string> {
-    const system = ROLE_PROMPTS[role] + NOTES_REMINDER;
-    let turnMessages = [...messages];
-    let lastResponse = "";
+    const { model, apiKey } = resolveModel(provider, modelId);
 
-    for (let turn = 0; turn < this.config.maxTurns; turn++) {
-      const response = await callLLM({
-        model,
-        system,
-        messages: turnMessages,
-        maxTokens: 4096,
-      });
+    // Build the coding tool set (shared cache across steps)
+    const tools = await this.getWorkerTools(workerWorkspace);
 
-      lastResponse = response;
+    const system = ROLE_PROMPTS[step.worker] + NOTES_REMINDER;
+    const initialMessage = this.buildInitialMessage(step, workerWorkspace, previousFailure);
 
-      // Extract and execute any bash blocks
-      const bashBlocks = this.extractBashBlocks(response);
-      if (bashBlocks.length === 0) {
-        // No more actions — worker is done
-        break;
+    // Track output parts
+    const outputParts: string[] = [];
+
+    const permMgr = this.permissions;
+
+    const agent = new PiAgent({
+      initialState: {
+        systemPrompt: system,
+        model: model as any,
+        tools: tools as any,
+        thinkingLevel: "off",
+        messages: [],
+      },
+      beforeToolCall: async (ctx: any) => {
+        const toolName = ctx.toolCall?.toolName ?? ctx.toolName ?? "";
+        const args     = ctx.args ?? {};
+        const allowed  = await permMgr.check(toolName, args);
+        if (!allowed) {
+          return { block: true, reason: `Tool "${toolName}" was denied` };
+        }
+      },
+      getApiKey: async () => apiKey || undefined,
+      convertToLlm: (msgs: AgentMessage[]): Message[] => {
+        // Filter to LLM-visible roles and pass through
+        return msgs.filter(
+          (m: any) => ["user", "assistant", "toolResult"].includes(m.role)
+        ) as any as Message[];
+      },
+    });
+
+    // Collect text output from assistant messages
+    const unsub = agent.subscribe((event: any) => {
+      if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
+        const delta = String(event.assistantMessageEvent.delta ?? "");
+        if (delta) outputParts.push(delta);
       }
+    });
 
-      // Execute bash blocks and collect output
-      const execResults = await this.executeBashBlocks(bashBlocks, workerWorkspace);
-      const outputMessage = this.formatExecResults(execResults);
+    try {
+      // Set up the timeout
+      const timeoutMs = 120_000; // 2 minutes per worker step
 
-      turnMessages = [...turnMessages, { role: "assistant", content: response }, { role: "user", content: outputMessage }];
+      await Promise.race([
+        agent.prompt(initialMessage),
+        new Promise<never>((_, rej) =>
+          setTimeout(() => rej(new Error(`Worker step timeout after 120s`)), timeoutMs)
+        ),
+      ]);
+    } catch (err: any) {
+      logger.warn(`[WorkerPool] Agent error for step ${step.id}: ${err.message}`);
+      // Return whatever output we collected (partial work may be salvageable)
+    } finally {
+      unsub();
     }
 
-    return lastResponse;
+    const fullOutput = outputParts.join("");
+    logger.info(`[WorkerPool] Step ${step.id} complete (${fullOutput.length} chars output)`);
+    return fullOutput;
   }
 
-  // ─── Bash execution ───────────────────────────────────────────
+  // ─── Worker tool factory ──────────────────────────────────────
 
-  private extractBashBlocks(text: string): string[] {
-    const blocks: string[] = [];
-    const regex = /```(?:bash|sh)\n([\s\S]*?)```/g;
-    let match: RegExpExecArray | null;
-    while ((match = regex.exec(text)) !== null) {
-      blocks.push(match[1].trim());
-    }
-    return blocks;
+  private async getWorkerTools(workspaceDir: string): Promise<AgentTool[]> {
+    if (this._toolCache) return this._toolCache;
+    // Use "standard" toolset: read, write, edit, bash, glob, grep, LSP, task, notebook
+    const tools = await createCoreTools("standard", workspaceDir);
+    this._toolCache = tools;
+    return tools;
   }
 
-  private async executeBashBlocks(
-    blocks: string[],
-    cwd: string
-  ): Promise<Array<{ command: string; stdout: string; stderr: string; exitCode: number }>> {
-    const results = [];
-    for (const command of blocks) {
-      try {
-        const { stdout, stderr } = await execAsync(command, {
-          cwd,
-          timeout: 30_000,
-          env: { ...process.env, NO_COLOR: "1" },
-        });
-        results.push({ command, stdout, stderr, exitCode: 0 });
-      } catch (err: any) {
-        results.push({
-          command,
-          stdout: err.stdout ?? "",
-          stderr: err.stderr ?? "",
-          exitCode: err.code ?? 1,
-        });
-      }
-    }
-    return results;
-  }
+  // ─── Message builders ─────────────────────────────────────────
 
-  private formatExecResults(
-    results: Array<{ command: string; stdout: string; stderr: string; exitCode: number }>
+  private buildInitialMessage(
+    step: PlanStep,
+    workerWorkspace: string,
+    previousFailure: VerificationResult | null,
   ): string {
-    return results
-      .map((r) =>
-        [
-          `$ ${r.command}`,
-          r.stdout.trim() ? r.stdout.trim() : "",
-          r.stderr.trim() ? `STDERR: ${r.stderr.trim()}` : "",
-          r.exitCode !== 0 ? `Exit code: ${r.exitCode}` : "",
-        ]
-          .filter(Boolean)
-          .join("\n")
-      )
-      .join("\n\n");
-  }
-
-  // ─── Workspace helpers ────────────────────────────────────────
-
-  private buildInitialUserMessage(step: PlanStep, workerWorkspace: string): Message {
     const artifactsDir = this.config.artifactsDir;
     const dependencyNote =
       step.depends_on.length > 0
         ? `\nPRIOR ARTIFACTS (read-only): ${artifactsDir}\nCheck ${artifactsDir} for outputs from steps: ${step.depends_on.join(", ")}`
         : "";
 
-    const content = `\
+    const recoveryNote = previousFailure
+      ? `\n\nPREVIOUS ATTEMPT FAILED:\nReason: ${previousFailure.reason}\nEvidence:\n${previousFailure.evidence.slice(0, 1000)}\n\nFix the specific issue described above. Do NOT rewrite everything.`
+      : "";
+
+    return `\
 STEP: ${step.id} (${step.type})
 BRIEF: ${step.brief}
 SCOPE (your writable directories): ${step.scope.join(", ")}
@@ -311,11 +312,12 @@ CONTRACT (what "done" means):
 ${step.output_contract.description}
 ${step.output_contract.fileExists ? `Required file: ${step.output_contract.fileExists}` : ""}
 ${step.output_contract.command ? `Verification command: ${step.output_contract.command}` : ""}
+${recoveryNote}
 
 Begin by writing NOTES.md with your plan, then execute.`;
-
-    return { role: "user", content };
   }
+
+  // ─── Workspace helpers ────────────────────────────────────────
 
   private async prepareWorkerWorkspace(step: PlanStep): Promise<string> {
     const workerDir = path.join(this.config.workspaceRoot, "workers", step.id);

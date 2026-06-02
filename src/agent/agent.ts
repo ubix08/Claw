@@ -1,63 +1,25 @@
-// src/agent/agent.ts — clawd local edition
+// src/agent/agent.ts — AI-OS Agent Runtime
 //
-// ─────────────────────────────────────────────────────────────────────────────
-// Context Assembler — mirrors Anthropic's production strategy exactly:
+// Wraps @mariozechner/pi-agent-core's Agent into a self-contained agent
+// process. Each Agent instance reads its identity and config from a filesystem
+// directory (the "agent folder") and runs as an independent LLM-powered
+// process with its own tools, skills, memory, and sessions.
+//
+// Context management (SURFACE 1/2/3):
 //
 //   SURFACE 1 — system prompt (_buildSystemPrompt)
 //     Rebuilt on every prompt() call from disk.
-//     Contains only STATIC identity: SOUL.md, skills registry, tool notes.
-//     Todo.md injected here as P1 — always present, never costs a turn.
+//     Contains STATIC identity: SOUL.md, skills registry, tool notes.
 //
 //   SURFACE 2 — convertToLlm (runs before every LLM inference turn)
-//     Implements Anthropic's tool_result clearing strategy:
-//       - Keeps last CTX_KEEP_TOOL_RESULTS tool results in full
-//       - Replaces older tool results with a short placeholder stub
-//       - Preserves the tool_use record so LLM knows the call happened
-//     Injects workspace state (NOTES.md) as the LAST message before
-//     LLM generation — exploiting end-of-context attention weighting.
+//     Keeps last CTX_KEEP_TOOL_RESULTS tool results in full.
+//     Replaces older tool results with a short stub.
+//     Injects workspace state (NOTES.md) as the LAST message — exploiting
+//     end-of-context attention weighting.
 //
 //   SURFACE 3 — compact() (triggered by caller when threshold reached)
-//     Replaces Anthropic's "clear_tool_uses" API feature with a
-//     client-side equivalent using replaceMessages().
-//     Preserves: last N turns verbatim + structured summary of older turns.
-//     Always references NOTES.md so LLM knows where its knowledge lives.
-//
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// Context budget targets (conservative for free-tier / Termux):
-//   CTX_KEEP_TOOL_RESULTS  = 3    keep last 3 tool results in full
-//   CTX_TOOL_RESULT_STUB   = 400  chars kept from old tool results
-//   CTX_NOTES_MAX_CHARS    = 3000 max chars of NOTES.md injected per turn
-//   CTX_COMPACT_KEEP_TURNS = 10   verbatim turns kept after compaction
-//   CTX_COMPACT_THRESHOLD  = 80   message count that triggers auto-compact
-//
-// Fix log (original):
-//   tools/index.ts was building AgentTool objects with plain JSON schema objects
-//   for the `parameters` field. pi-agent-core requires TypeBox TSchema objects
-//   (from @mariozechner/pi-ai Type.*). When AJV attempts to validate tool call
-//   arguments using the TypeBox format, it throws internally. The agent loop
-//   catches this, logs nothing visible, and produces zero output.
-//   Fix is in tools/index.ts (Type.Object / Type.String / etc.).
-//
-// Fix log (team refactor / env regression):
-//   [AGENT-ENV-FIX-1] _buildTools() now forwards this._globalConfig to
-//     createCoreTools(). Previously createCoreTools() was called without the
-//     global config, so config.skills.entries["web-search"].apiKey was never
-//     seen by createWebSearchTool(). The key reached process.env only if the
-//     OpenClaw web-search SKILL was physically installed (triggering
-//     _injectEnv() during loadSkills()) or if the key was already in
-//     ~/.clawd/.env. If the key was configured solely via clawd.json entries
-//     without the skill installed, the built-in web_search tool silently got
-//     no key and returned "SERPER_API_KEY not set" on every call.
-//
-// New fixes:
-//   [VERBOSITY-SYS-PROMPT] _buildSystemPrompt() branches on
-//     this.config.verbosity ("concise" | "explicit"). When "explicit", a
-//     "Tool Examples" block with concrete worked examples for every core tool
-//     is appended to the system prompt. This closes 30-40% of the capability
-//     gap for smaller OSS models (≤14B) without changing frontier model behavior.
-//   [VERBOSITY-TOOLNOTE] _toolSetNote() gains a third `verbose` parameter to
-//     carry the verbosity flag from _buildSystemPrompt().
+//     Stubs old tool results + summarizes old turns when message count
+//     exceeds CTX_COMPACT_THRESHOLD.
 
 import * as fs   from "fs";
 import * as path from "path";
@@ -77,6 +39,8 @@ import type { AgentRunResult }   from "../core/types.js";
 import type { EventBus }         from "../core/event-bus.js";
 import type { GlobalConfig }     from "../config.js";
 import type { SkillsSnapshot }   from "../skills.js";
+import { resolveModel, resetModelCache } from "../core/model-resolver.js";
+import { PermissionManager }             from "../core/permissions.js";
 
 // ── Context assembler constants ───────────────────────────────────────────────
 
@@ -96,43 +60,7 @@ const CTX_COMPACT_KEEP_TURNS = 10;
 /** Message count that triggers auto-compact inside prompt(). */
 const CTX_COMPACT_THRESHOLD  = 80;
 
-// ── Provider → pi-ai API mapping ─────────────────────────────────────────────
-
-const PROVIDER_API: Record<string, string> = {
-  anthropic:  "anthropic-messages",
-  openai:     "openai-completions",
-  google:     "google-generative-ai",
-  groq:       "openai-completions",
-  openrouter: "openai-completions",
-  deepseek:   "openai-completions",
-  mistral:    "openai-completions",
-  cerebras:   "openai-completions",
-  xai:        "openai-completions",
-  together:   "openai-completions",
-  fireworks:  "openai-completions",
-  cohere:     "openai-completions",
-  zai:        "openai-completions",
-  sambanova:  "openai-completions",
-};
-
-const VALID_API_STRINGS = new Set([
-  "anthropic-messages",
-  "google-generative-ai",
-  "google-gemini-cli",
-  "google-vertex",
-  "mistral-conversations",
-  "openai-completions",
-  "openai-responses",
-  "openai-codex-responses",
-  "azure-openai-responses",
-  "bedrock-converse-stream",
-]);
-
-interface RegistryCache {
-  registry: { providers?: Record<string, any> };
-  mtimeMs:  number;
-  filePath: string;
-}
+// Provider → pi-ai API mapping moved to core/model-resolver.ts
 
 // ── Agent class ───────────────────────────────────────────────────────────────
 
@@ -150,9 +78,8 @@ export class Agent {
   private _builtinTools:           AgentTool[] = [];
   private _configFingerprint       = "";
   private _skillsConfigFingerprint = "";
-  private _modelsCache:            RegistryCache | null = null;
-  private _authCache:              Record<string, string> | null = null;
   private _modelsPath:             string;
+  private _permissionManager:      PermissionManager;
 
   get name(): string          { return this.config.name; }
   get model(): string         { return this.config.model    ?? this._globalConfig.defaults.model; }
@@ -180,6 +107,7 @@ export class Agent {
     this._configFingerprint       = JSON.stringify(config);
     this._skillsConfigFingerprint = _skillsFingerprint(globalConfig);
     this._modelsPath              = modelsPath ?? CLAWD_MODELS_PATH;
+    this._permissionManager       = new PermissionManager(bus);
   }
 
   async init(): Promise<void> {
@@ -696,112 +624,7 @@ export class Agent {
   }
 
   private _buildModel(provider: string, modelId: string): Model<any> {
-    const modelsPath = this._modelsPath;
-    let registry: { providers?: Record<string, any> } = {};
-    try {
-      if (!fs.existsSync(modelsPath)) throw new Error(`models.json not found at ${modelsPath}`);
-      const stat = fs.statSync(modelsPath);
-      if (
-        this._modelsCache &&
-        this._modelsCache.filePath === modelsPath &&
-        this._modelsCache.mtimeMs === stat.mtimeMs
-      ) {
-        registry = this._modelsCache.registry;
-      } else {
-        registry = JSON.parse(fs.readFileSync(modelsPath, "utf-8"));
-        this._modelsCache = { registry, mtimeMs: stat.mtimeMs, filePath: modelsPath };
-      }
-    } catch (e: any) {
-      throw new Error(`Cannot read models.json at ${modelsPath}: ${e.message}`);
-    }
-
-    const provDef = registry.providers?.[provider];
-    if (!provDef) {
-      throw new Error(
-        `Provider "${provider}" not found in models.json. ` +
-        `Available: ${Object.keys(registry.providers ?? {}).join(", ")}`,
-      );
-    }
-
-    const modelDef = (provDef.models ?? []).find((m: any) => m.id === modelId);
-    if (!modelDef) {
-      throw new Error(`Model "${modelId}" not found under provider "${provider}" in models.json.`);
-    }
-
-    // ── API key resolution — three sources in priority order ─────────────────
-    //
-    // 1. models.json provDef.apiKey — if it looks like an env var name
-    //    (ALL_CAPS_WITH_UNDERSCORES) resolve from process.env; otherwise use
-    //    the literal string value.
-    //
-    // 2. process.env fallback — try PROVIDER_API_KEY and PROVIDER_APIKEY
-    //    conventions if models.json gave nothing.
-    //
-    // 3. auth.json — ~/.clawd/auth.json keyed by provider name, structure:
-    //    { "<provider>": { "type": "api_key", "key": "<value>" } }
-    //    This is the file used by the clawd setup wizard and the UI.
-
-    let apiKey = "";
-
-    // Source 1: models.json
-    if (typeof provDef.apiKey === "string" && provDef.apiKey.length > 0) {
-      apiKey = /^[A-Z][A-Z0-9_]+$/.test(provDef.apiKey)
-        ? (process.env[provDef.apiKey] ?? "")
-        : provDef.apiKey;
-    }
-
-    // Source 2: process.env conventions (PROVIDER_API_KEY, PROVIDER_APIKEY)
-    if (!apiKey) {
-      const envKey1 = provider.toUpperCase().replace(/-/g, "_") + "_API_KEY";
-      const envKey2 = provider.toUpperCase().replace(/-/g, "_") + "_APIKEY";
-      apiKey = process.env[envKey1] ?? process.env[envKey2] ?? "";
-    }
-
-    // Source 3: auth.json
-    if (!apiKey) {
-      apiKey = this._loadAuthKey(provider);
-    }
-
-    if (!apiKey) {
-      logger.warn(`[Agent:${this.id}] No API key resolved for provider "${provider}" — requests will likely fail`);
-    }
-
-    const rawApi = provDef.api as string | undefined;
-    let api: string;
-    if (rawApi && VALID_API_STRINGS.has(rawApi)) {
-      api = rawApi;
-    } else {
-      if (rawApi) {
-        logger.warn(
-          `[Agent:${this.id}] models.json provider "${provider}" has unknown api "${rawApi}". ` +
-          `Falling back to PROVIDER_API map.`,
-        );
-      }
-      api = PROVIDER_API[provider] ?? "openai-completions";
-    }
-
-    const model: Model<any> = {
-      id:            modelId,
-      name:          modelDef.name ?? modelId,
-      provider,
-      api,
-      baseUrl:       provDef.baseUrl ?? "",
-      reasoning:     modelDef.reasoning ?? false,
-      input:         modelDef.input ?? ["text"],
-      contextWindow: modelDef.contextWindow ?? 200_000,
-      maxTokens:     modelDef.maxTokens ?? 8192,
-      cost: {
-        input:      modelDef.cost?.input      ?? 0,
-        output:     modelDef.cost?.output     ?? 0,
-        cacheRead:  modelDef.cost?.cacheRead  ?? 0,
-        cacheWrite: modelDef.cost?.cacheWrite ?? 0,
-      },
-    };
-
-    logger.debug(
-      `[Agent:${this.id}] Model resolved: ${provider}/${modelId} via ${api}` +
-      `${model.baseUrl ? ` at ${model.baseUrl}` : ""}`,
-    );
+    const { model } = resolveModel(provider, modelId, this._modelsPath);
     return model;
   }
 
@@ -841,7 +664,8 @@ export class Agent {
     // inference turn, not just at construction time.
     const workspaceDir = this.workspace.workspaceDir;
     const agentId      = this.id;
-    const self         = this;
+
+    const permMgr = this._permissionManager;
 
     const piAgent = new PiAgent({
       initialState: {
@@ -852,13 +676,24 @@ export class Agent {
         messages:      restoredMessages,
       },
 
-      // ── getApiKey ─────────────────────────────────────────────────────────
-      // Called by pi-agent-core on every LLM call.
-      // Returns the resolved key from auth.json as a runtime fallback,
-      // complementing what _buildModel() already set on the Model object.
+      // beforeToolCall — permission check hook
+      beforeToolCall: async (ctx: any) => {
+        const toolName = ctx.toolCall?.toolName ?? ctx.toolName ?? "";
+        const args     = ctx.args ?? {};
+        const allowed  = await permMgr.check(toolName, args);
+        if (!allowed) {
+          return { block: true, reason: `Tool "${toolName}" was denied` };
+        }
+      },
+
+      // getApiKey delegates to the shared model resolver for auth.json fallback.
       getApiKey: async (provider: string): Promise<string | undefined> => {
-        const key = self._loadAuthKey(provider);
-        return key || undefined;
+        try {
+          const { apiKey } = resolveModel(provider, this.model, this._modelsPath);
+          return apiKey || undefined;
+        } catch {
+          return undefined;
+        }
       },
 
       // ── convertToLlm ──────────────────────────────────────────────────────
@@ -972,33 +807,16 @@ export class Agent {
   //
   // SURFACE 1: rebuilt from disk on every prompt() call.
   //
-  // Layer order mirrors Anthropic's documented P0/P1/P2 priority stack:
-  //
   //   P0 — Identity (SOUL.md, AGENT.md via workspace.buildSystemPromptSection)
   //   P0 — Skills registry (frontmatter-only summaries, full body on demand)
-  //   P1 — Active project state (Todo.md) — injected here so it is always
-  //         present without consuming a message slot or requiring a turn.
-  //         Rebuilt fresh from disk every call so agent always sees current state.
-  //   P0 — Tool access notes, mode instructions
+  //   P0 — Tool access notes
   //
   // NOTES.md is NOT injected here — it lives in convertToLlm (Surface 2)
   // as the last user message, where it receives maximum attention weight.
   //
-  // [VERBOSITY-SYS-PROMPT] When config.verbosity === "explicit", _toolSetNote()
-  // is called with verbose=true, injecting a "Tool Examples" block with
-  // concrete worked examples for every core tool. This closes 30-40% of the
-  // capability gap for smaller OSS models (Qwen2.5-7B, GLM-4, etc.) without
-  // affecting frontier model behavior — frontier models ignore the extra tokens.
-  //
-  private _buildSystemPrompt(options: PromptOptions): string {
+  private _buildSystemPrompt(_options: PromptOptions): string {
     const parts: string[] = [];
 
-    // [VERBOSITY-SYS-PROMPT] Determine verbosity tier from agent config.
-    // "explicit" injects worked tool examples into the system prompt.
-    // Anything else (or absent) uses the concise default path.
-    const verbose = this.config.verbosity === "explicit";
-
-    // Date context
     parts.push(
       `Today is ${new Date().toLocaleDateString("en-US", {
         weekday: "long", year: "numeric", month: "long", day: "numeric",
@@ -1014,109 +832,22 @@ export class Agent {
       parts.push(
         `## Skills\n\n` +
         `You have the following skills available. Before using a skill, read its ` +
-        `\`SKILL.md\` via the relative path shown below (e.g. \`read("skills/web-search/SKILL.md")\`).\n\n` +
+        `\`SKILL.md\` via the relative path shown below.\n\n` +
         this._skills.prompt,
       );
     }
 
-    // P1: Active project — Todo.md
-    // Read fresh from disk every call. Agent updates it via write tool;
-    // next prompt() picks up changes automatically.
-    // Not injected in convertToLlm because it is STATIC per prompt() call —
-    // it changes between calls, not between turns within a call.
-    const todoPath = path.join(this.workspace.workspaceDir, "Todo.md");
-    try {
-      if (fs.existsSync(todoPath)) {
-        const todo = fs.readFileSync(todoPath, "utf-8").trim();
-        if (todo) {
-          parts.push(
-            `## Active Project — Todo.md\n\n` +
-            `This is your current project plan and execution state. ` +
-            `Update it with the write tool as you complete steps.\n\n` +
-            todo,
-          );
-        }
-      }
-    } catch (e: any) {
-      logger.debug(`[Agent:${this.id}] _buildSystemPrompt: cannot read Todo.md: ${e.message}`);
-    }
-
-    // Prior agent outputs (team mode)
-    const prior = options.priorOutputs;
-    if (prior && Object.keys(prior).length > 0) {
-      const lines = Object.entries(prior)
-        .map(([n, p]) => `  - **${n}**: \`${p}\``)
-        .join("\n");
-      parts.push(
-        `## Prior Agent Outputs\n\n${lines}\n\n` +
-        `Read each output file with the \`read\` tool before starting your own work.`,
-      );
-    }
-
-    // Work mode instructions
-    if (options.mode === "work") {
-      parts.push(
-        `## Task Mode\n\n` +
-        `You are in **work mode**. Complete the assigned task fully, ` +
-        `then write your complete result to \`workspace/output.md\`.\n\n` +
-        `- Save all working files inside \`workspace/\`\n` +
-        `- Use relative paths only\n` +
-        `- Do not navigate outside your root with \`../\``,
-      );
-    }
-
     // Tool access note
-    // [VERBOSITY-SYS-PROMPT] Pass verbosity flag so smaller models receive
-    // worked tool examples embedded directly in the system prompt.
     const customToolNames = this._builtinTools
       .map(t => t.name)
       .filter(n => !["read", "write", "edit", "bash"].includes(n));
-    const toolNote = _toolSetNote(this.config.tools, customToolNames, verbose);
+    const toolNote = _toolSetNote(this.config.tools, customToolNames);
     if (toolNote) parts.push(`## Tool Access\n\n${toolNote}`);
 
     return parts.join("\n\n---\n\n");
   }
 
-  // ── _loadAuthKey ──────────────────────────────────────────────────────────────
-  //
-  // Reads ~/.clawd/auth.json and returns the key for `provider`.
-  // auth.json format:
-  //   { "<provider>": { "type": "api_key", "key": "<value>" } }
-  //
-  // The parsed result is cached in _authCache for the lifetime of the Agent
-  // instance. The cache is intentionally never invalidated — auth keys don't
-  // change mid-session. A process restart picks up any new auth.json.
-
-  private _loadAuthKey(provider: string): string {
-    if (!this._authCache) {
-      const authPath = path.join(path.dirname(this._modelsPath), "auth.json");
-      try {
-        if (fs.existsSync(authPath)) {
-          const raw = fs.readFileSync(authPath, "utf-8");
-          const parsed = JSON.parse(raw);
-          const cache: Record<string, string> = {};
-          for (const [prov, entry] of Object.entries(parsed)) {
-            if (
-              entry &&
-              typeof entry === "object" &&
-              typeof (entry as any).key === "string" &&
-              (entry as any).key.length > 0
-            ) {
-              cache[prov] = (entry as any).key;
-            }
-          }
-          this._authCache = cache;
-          logger.debug(`[Agent:${this.id}] auth.json loaded (${Object.keys(cache).length} providers)`);
-        } else {
-          this._authCache = {};
-        }
-      } catch (e: any) {
-        logger.warn(`[Agent:${this.id}] Cannot read auth.json: ${e.message}`);
-        this._authCache = {};
-      }
-    }
-    return this._authCache[provider] ?? "";
-  }
+  // _loadAuthKey removed — logic moved to core/model-resolver.ts
 
   private _loadPersistedMessages(): AgentMessage[] {
     const jsonlPath = path.join(this.workspace.sessionsDir, "session.jsonl");
@@ -1166,17 +897,12 @@ function _skillsFingerprint(globalConfig: GlobalConfig): string {
   });
 }
 
-// [VERBOSITY-TOOLNOTE] Third parameter `verbose` added (default: false).
-// When verbose=true, a "Tool Examples" block with concrete worked examples
-// is appended for all four core tools. When false (default), the return value
-// is byte-for-byte identical to the previous implementation — no regression
-// for concise (frontier) mode.
-function _toolSetNote(toolSet: string, customToolNames: string[] = [], verbose = false): string {
+function _toolSetNote(toolSet: string, customToolNames: string[] = []): string {
   const base = (() => {
     switch (toolSet) {
       case "full":
-      case "coding":   return "Core file tools available: **read**, **write**, **edit**, **bash**.";
-      case "readonly": return "Read-only mode: **read** only. No write, edit, or bash.";
+      case "standard": return "Core file tools available: **read**, **write**, **edit**, **bash**.";
+      case "observe":  return "Read-only mode: **read** only. No write, edit, or bash.";
       case "bash":     return "Available: **read** + **bash**. No write or edit.";
       case "none":     return "No file or bash tools available.";
       default:         return "";
@@ -1187,53 +913,7 @@ function _toolSetNote(toolSet: string, customToolNames: string[] = [], verbose =
     ? `Additional tools: ${customToolNames.join(", ")}.`
     : "";
 
-  const summary = [base, extra].filter(Boolean).join(" ");
-
-  if (!verbose) return summary;
-
-  // [VERBOSITY-TOOLNOTE] Explicit mode: inject worked examples.
-  // Deliberately copy-paste concrete — abstract descriptions cause small
-  // models to hallucinate argument names or skip required fields.
-  // Frontier models skip the extra tokens with no measurable regression.
-  const examples = `
-
-## Tool Examples
-
-Use these exact argument patterns. Do not guess parameter names.
-
-**read** — Read a file or list a directory
-\`\`\`
-read(path: "src/index.ts")                         // read entire file
-read(path: "src/index.ts", offset: 50, limit: 50)  // read lines 51–100
-read(path: "src/")                                 // list directory contents
-\`\`\`
-
-**write** — Create or overwrite a file (also creates parent directories)
-\`\`\`
-write(path: "src/hello.ts", content: "console.log('hello');")
-\`\`\`
-After writing, the tool reports how many lines and bytes were saved.
-Verify the numbers match what you intended before continuing.
-
-**edit** — Replace an exact substring inside an existing file
-\`\`\`
-edit(path: "src/index.ts", oldText: "const x = 1;", newText: "const x = 2;")
-// Replace every occurrence:
-edit(path: "src/config.ts", oldText: "localhost", newText: "0.0.0.0", replace_all: true)
-\`\`\`
-oldText must match the file EXACTLY — same whitespace, same newlines.
-If oldText is not found the tool returns an error; read the file and correct it before retrying.
-
-**bash** — Run a shell command in the workspace root
-\`\`\`
-bash(command: "ls -la")
-bash(command: "npm install", timeout: 60)
-bash(command: "node -e \\"console.log(process.version)\\"")
-\`\`\`
-If the command fails, the result shows the error and asks you to diagnose
-the cause before retrying. Do not retry the same command unchanged.`;
-
-  return summary + examples;
+  return [base, extra].filter(Boolean).join(" ");
 }
 
 function _argSummary(args: any): string {

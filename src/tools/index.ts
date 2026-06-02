@@ -13,8 +13,8 @@
 //
 // Tool sets (config.tools):
 //   "full"     → read + write + edit + bash + web_search + web_fetch
-//   "coding"   → read + write + edit + bash (no web)
-//   "readonly" → read only
+//   "standard" → read + write + edit + bash (no web)
+//   "observe"  → read only
 //   "bash"     → read + bash
 //   "none"     → [] (no file/bash tools)
 //
@@ -69,6 +69,7 @@ export { createToolSearchTool }  from "./tool-search.js";
 export { createNotebookEditTool } from "./notebook-edit.js";
 export { createLspTool }         from "./lsp.js";
 export { createCronTools }       from "./cron.js";
+export { createGitTools }        from "./git.js";
 
 import { createWebSearchTool } from "./web-search.js";
 import { createWebFetchTool }  from "./web-fetch.js";
@@ -83,6 +84,7 @@ import { createToolSearchTool } from "./tool-search.js";
 import { createNotebookEditTool } from "./notebook-edit.js";
 import { createLspTool }        from "./lsp.js";
 import { createCronTools }      from "./cron.js";
+import { createGitTools }       from "./git.js";
 
 import type { AgentTool } from "../agent/types.js";
 import type { GlobalConfig } from "../config.js";
@@ -467,6 +469,7 @@ export async function createCoreTools(
         createNotebookEditTool(workspaceDir),
         createLspTool(workspaceDir),
         ...createCronTools(workspaceDir),
+        ...createGitTools(workspaceDir),
         createWebSearchTool(webSearchApiKey ? { apiKey: webSearchApiKey } : {}),
         createWebFetchTool(),
       ];
@@ -480,7 +483,7 @@ export async function createCoreTools(
 
       return tools;
     }
-    case "coding": {
+    case "standard": {
       const tools: AgentTool[] = [
         createReadTool(workspaceDir),
         createWriteTool(workspaceDir),
@@ -489,6 +492,7 @@ export async function createCoreTools(
         createGlobTool(workspaceDir),
         createGrepTool(workspaceDir),
         ...createTaskTools(workspaceDir),
+        ...createGitTools(workspaceDir),
         createNotebookEditTool(workspaceDir),
         createLspTool(workspaceDir),
       ];
@@ -502,7 +506,7 @@ export async function createCoreTools(
 
       return tools;
     }
-    case "readonly":
+    case "observe":
       return [createReadTool(workspaceDir)];
     case "bash":
       return [createReadTool(workspaceDir), createBashTool(workspaceDir)];

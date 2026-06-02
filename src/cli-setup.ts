@@ -30,7 +30,7 @@ import {
   CONFIG_PATH, CLAWD_DIR, CLAWD_AGENTS_DIR, CLAWD_MODELS_PATH,
   DEFAULT_AGENT_ID,
 } from "./config.js";
-import { scaffoldAgent } from "./agent/loader.js";
+import { scaffoldAgent, listAgentIds } from "./agent/loader.js";
 import type { AgentConfig }    from "./agent/types.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -154,6 +154,65 @@ export async function _runSetupWizard(): Promise<void> {
   };
   scaffoldAgent(DEFAULT_AGENT_ID, defaultAgentCfg, false);
   console.log(chalk.green(`  ✓ Default agent "${assistantName}" (${DEFAULT_AGENT_ID})`));
+
+  // ── Default agent roles (OpenCode-style) ──────────────────────────────────
+  // Scaffold a standard set of subagent roles that can be spawned via the agent tool.
+  const defaultRoles: Array<{ id: string; name: string; desc: string; tools: AgentConfig["tools"] }> = [
+    {
+      id:    "explore",
+      name:  "Explore",
+      desc:  "Specialized codebase exploration agent. Fast, thorough, read-only.",
+      tools: "observe",
+    },
+    {
+      id:    "technical-writer",
+      name:  "Technical Writer",
+      desc:  "Specialized documentation agent. Writes clear, well-structured docs.",
+      tools: "standard",
+    },
+    {
+      id:    "qa-engineer",
+      name:  "QA Engineer",
+      desc:  "Specialized testing agent. Writes and runs tests, finds bugs.",
+      tools: "standard",
+    },
+    {
+      id:    "lead-architect",
+      name:  "Lead Architect",
+      desc:  "Specialized architecture agent. Designs system structure, reviews code.",
+      tools: "standard",
+    },
+    {
+      id:    "software-engineer",
+      name:  "Software Engineer",
+      desc:  "General-purpose engineering agent. Writes and refactors code.",
+      tools: "full",
+    },
+  ];
+
+  const existingIds = listAgentIds();
+  let rolesScaffolded = 0;
+  for (const role of defaultRoles) {
+    if (existingIds.includes(role.id)) continue;
+    const roleConfig: AgentConfig = {
+      name:           role.name,
+      description:    role.desc,
+      provider,
+      model,
+      tools:          role.tools,
+      persistent:     false,
+      maxTurns:       config.defaults.maxTurns,
+      timeoutSeconds: config.defaults.timeoutSeconds,
+      thinkingLevel:  role.id === "lead-architect" ? "high" : config.defaults.thinkingLevel,
+    };
+    scaffoldAgent(role.id, roleConfig, false);
+    rolesScaffolded++;
+  }
+  if (rolesScaffolded > 0) {
+    console.log(chalk.green(`  ✓ ${rolesScaffolded} default agent roles scaffolded`));
+  } else {
+    console.log(chalk.dim("  · Default agent roles (already exist)"));
+  }
 
   const userMd = path.join(CLAWD_AGENTS_DIR, DEFAULT_AGENT_ID, "USER.md");
   if (!fs.existsSync(userMd)) {

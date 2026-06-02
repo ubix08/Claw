@@ -38,6 +38,7 @@ import { getDefaultBus }   from "../core/event-bus.js";
 import { loadConfig }      from "../config.js";
 import { logger }          from "../core/logger.js";
 import { hasOptimizedTemplates, getOptimizedScaffoldFiles } from "./scaffold-optimizer.js";
+import { discoverProjectConfig } from "../core/project-discovery.js";
 import type { AgentConfig } from "./types.js";
 import type { EventBus }    from "../core/event-bus.js";
 import type { GlobalConfig } from "../config.js";
@@ -117,14 +118,56 @@ export function loadAgent(
   return loadAgentFromPath(agentId, agentDir(agentId), bus, globalConfig);
 }
 
+/**
+ * Load an Agent by searching project-level agent folders first, then falling
+ * back to the global agents directory.
+ *
+ * Project agent folders are discovered via project-discovery:
+ *   - <project>/agents/<id>/
+ *   - <project>/.claude/agents/<id>/
+ *   - <project>/.opencode/agents/<id>/
+ *   - <project>/.clawd/agents/<id>/
+ *
+ * If not found in any project folder, falls back to global loadAgent().
+ */
+export function loadAgentFromProject(
+  agentId:      string,
+  bus:          EventBus      = getDefaultBus(),
+  globalConfig: GlobalConfig  = loadConfig(),
+): Agent {
+  // First check project-level agent folders
+  const projectDiscovery = discoverProjectConfig();
+  for (const agentFolder of projectDiscovery.agentFolders) {
+    const id = path.basename(agentFolder);
+    if (id === agentId) {
+      return loadAgentFromPath(agentId, agentFolder, bus, globalConfig);
+    }
+  }
+
+  // Fallback to global
+  return loadAgent(agentId, bus, globalConfig);
+}
+
 export function listAgentIds(): string[] {
+  const ids = new Set<string>();
+
+  // Global agents
   const dir = getAgentsDir();
-  if (!fs.existsSync(dir)) return [];
-  return fs
-    .readdirSync(dir, { withFileTypes: true })
-    .filter(e => e.isDirectory())
-    .map(e => e.name)
-    .sort();
+  if (fs.existsSync(dir)) {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.isDirectory()) ids.add(entry.name);
+    }
+  }
+
+  // Project-level agents (best-effort)
+  try {
+    const projectDiscovery = discoverProjectConfig();
+    for (const agentFolder of projectDiscovery.agentFolders) {
+      ids.add(path.basename(agentFolder));
+    }
+  } catch {}
+
+  return [...ids].sort();
 }
 
 /**

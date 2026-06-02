@@ -1,25 +1,14 @@
 // src/agent/types.ts
-// Pure OpenClaw-compatible agent configuration.
+// AI-OS Agent type definitions.
 //
 // [TYPES-FIX-CRITICAL] AgentTool.parameters must be TSchema (TypeBox), not
 // Record<string,unknown>. pi-agent-core validates tool call arguments using
-// AJV with the TypeBox format plugin — it expects a compiled TypeBox schema,
-// not a raw JSON schema object. Passing a plain object causes AJV to throw
-// internally in the agent loop, producing a silent crash with no response.
-//
-// [VERBOSITY-FIX] Added `verbosity` field to AgentConfig.
-//   "concise"  (default) — model-agnostic prompt, suitable for frontier models
-//                          (Claude Sonnet, Deepseek-V3, Qwen2.5-72B).
-//   "explicit" — verbose prompt with worked tool examples injected into the
-//                system prompt. Closes 30-40% of the capability gap for smaller
-//                open-source models (Qwen2.5-7B, GLM-4-9B, Deepseek-Coder-33B)
-//                that cannot reliably infer tool usage from sparse descriptions.
-//   Set per-agent in config.json:  { "verbosity": "explicit" }
+// AJV with the TypeBox format plugin — it expects a compiled TypeBox schema.
 
 import type { TSchema } from "@mariozechner/pi-ai";
 import type { HeartbeatDef } from "../core/heartbeat.js";
 
-export type AgentToolSet = "full" | "coding" | "readonly" | "bash" | "none";
+export type AgentToolSet = "full" | "standard" | "observe" | "bash" | "none";
 
 export interface AgentConfig {
   name:            string;
@@ -31,17 +20,27 @@ export interface AgentConfig {
   maxTurns:        number;
   timeoutSeconds:  number;
   thinkingLevel?:  "off" | "minimal" | "low" | "medium" | "high";
-  /**
-   * [VERBOSITY-FIX] System prompt verbosity tier.
-   *
-   * "concise"  — sparse, model-agnostic descriptions (default).
-   *              Works well with frontier models that can infer tool usage.
-   * "explicit" — injected worked examples for every core tool.
-   *              Required for smaller OSS models (≤14B) to use tools reliably.
-   */
-  verbosity?:      "concise" | "explicit";
   heartbeats?:     HeartbeatDef[];
   tags?:           string[];
+}
+
+/**
+ * Lightweight agent definition used for subagent spawning.
+ */
+export interface AgentRoleDefinition {
+  id:                  string;
+  name:                string;
+  description:         string;
+  tools?:              AgentToolSet;
+  persistent?:         boolean;
+  maxTurns?:           number;
+  timeoutSeconds?:     number;
+  provider?:           string;
+  model?:              string;
+  workspace?:          string;
+  systemPromptPrefix?: string;
+  systemPromptSuffix?: string;
+  tags?:               string[];
 }
 
 export interface PromptOptions {

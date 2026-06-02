@@ -45,6 +45,11 @@ interface AgentParams {
  *
  * Spawns a subagent with isolated context window to handle specialized tasks.
  * Subagents work independently and return summaries when complete.
+ *
+ * [COMMANDS] The tool description now references "Available Commands" in the
+ * system prompt so the LLM knows which subagent types are available. Manually
+ * passed subagent_type values are also checked against project-level agent
+ * folders (via loadAgentFromProject) for OpenCode-style command parity.
  */
 export function createAgentTool(
   bus: EventBus,
@@ -58,12 +63,14 @@ export function createAgentTool(
       "Spawn a subagent with isolated context window to handle specialized tasks. " +
       "Subagents don't see your conversation history and work independently. " +
       "Use for: codebase exploration (subagent_type: 'explore'), parallel research, " +
-      "independent analysis, or any task that shouldn't bloat main context.",
+      "independent analysis, or any task that shouldn't bloat main context.\n\n" +
+      "Available subagent types are listed under 'Available Commands' in the system prompt. " +
+      "Pass the command name as subagent_type to spawn a project-defined subagent.",
     parameters: agentSchema,
     execute: async (_id, params: AgentParams) => {
       try {
         // Lazy-load Agent to avoid circular dependency
-        const { loadAgent } = await import("../agent/loader.js");
+        const { loadAgentFromProject } = await import("../agent/loader.js");
 
         // Determine subagent ID
         const timestamp = Date.now();
@@ -94,8 +101,8 @@ export function createAgentTool(
           agentIdToLoad = await ensureExploreAgent(globalConfig);
         }
 
-        // Load the subagent
-        const subagent = loadAgent(agentIdToLoad, bus, globalConfig);
+        // Load the subagent from project folders first, then fallback to global
+        const subagent = loadAgentFromProject(agentIdToLoad, bus, globalConfig);
 
         // Override model if specified
         if (params.model) {
@@ -230,7 +237,7 @@ async function ensureExploreAgent(globalConfig: GlobalConfig): Promise<string> {
     description: "Specialized codebase exploration agent. Fast, thorough, read-only.",
     model: globalConfig.defaults.model,
     provider: globalConfig.defaults.provider,
-    tools: "readonly" as const,  // Read + Glob + Grep only
+    tools: "observe" as const,  // Read + Glob + Grep only
     persistent: false,  // Don't persist sessions (each invocation is fresh)
     maxTurns: 30,
     timeoutSeconds: 180,  // 3 minutes
