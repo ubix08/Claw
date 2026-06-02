@@ -8,7 +8,7 @@
 import type { TSchema } from "@mariozechner/pi-ai";
 import type { HeartbeatDef } from "../core/heartbeat.js";
 
-export type AgentToolSet = "full" | "standard" | "observe" | "bash" | "none";
+export type AgentToolSet = "full" | "standard" | "observe" | "bash" | "none" | string[];
 
 export interface AgentConfig {
   name:            string;

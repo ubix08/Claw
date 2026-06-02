@@ -11,12 +11,18 @@
 // Fix: Replace all plain { type:"object", properties:{...} } objects with
 // Type.Object({ ... }) from @mariozechner/pi-ai which re-exports TypeBox.
 //
-// Tool sets (config.tools):
-//   "full"     → read + write + edit + bash + web_search + web_fetch
-//   "standard" → read + write + edit + bash (no web)
+// Tool sets (config.tools — preset name or explicit array of tool names):
+//   "full"     → read, write, edit, bash, glob, web_search, web_fetch, mcp,
+//                tool_search, cron, agent
+//   "standard" → read, write, edit, bash, glob, agent
 //   "observe"  → read only
 //   "bash"     → read + bash
 //   "none"     → [] (no file/bash tools)
+//   string[]   → any combination of: read, write, edit, bash, glob, grep,
+//                web_search, web_fetch, mcp, tool_search, notebook_edit, lsp,
+//                cron, git, tasks, agent
+//   Coding-specific tools (grep, git, lsp, notebook_edit, tasks) are available
+//   via explicit array but removed from all presets — they are domain skills.
 //
 // web_search: SERPER_API_KEY resolved from (in priority order):
 //   1. config.skills.entries["web-search"].apiKey  (clawd.json)
@@ -442,82 +448,83 @@ function createBashTool(workspaceDir: string): AgentTool {
 // If neither source provides a key the tool is still registered and returns a
 // clear error on first call — preferable to a silent "tool not found" failure.
 
-export async function createCoreTools(
-  toolSet:      string,
-  workspaceDir: string,
-  globalConfig?: GlobalConfig,   // [TOOLS-ENV-FIX-1] optional — safe for all callers
-  bus?:         EventBus,         // [AGENT-TOOL] optional — required for Agent tool
-): Promise<AgentTool[]> {
+function _presetToolNames(toolSet: string): string[] {
   switch (toolSet) {
-    case "full": {
-      // [TOOLS-ENV-FIX-1] Bridge config.skills.entries["web-search"].apiKey →
-      // createWebSearchTool opts so users only need to configure the key in one
-      // place (clawd.json OR ~/.clawd/.env — not both).
-      const webSearchApiKey =
-        globalConfig?.skills?.entries?.["web-search"]?.apiKey ?? undefined;
-
-      const tools: AgentTool[] = [
-        createReadTool(workspaceDir),
-        createWriteTool(workspaceDir),
-        createEditTool(workspaceDir),
-        createBashTool(workspaceDir),
-        createGlobTool(workspaceDir),
-        createGrepTool(workspaceDir),
-        ...createTaskTools(workspaceDir),
-        ...createMcpTools(),
-        createToolSearchTool(),
-        createNotebookEditTool(workspaceDir),
-        createLspTool(workspaceDir),
-        ...createCronTools(workspaceDir),
-        ...createGitTools(workspaceDir),
-        createWebSearchTool(webSearchApiKey ? { apiKey: webSearchApiKey } : {}),
-        createWebFetchTool(),
-      ];
-
-      // Add Agent tool if bus and globalConfig are provided
-      // Lazy-load to break circular dependency: agent/agent.ts imports this file
-      if (bus && globalConfig) {
-        const { createAgentTool } = await import("./agent.js");
-        tools.push(createAgentTool(bus, globalConfig, workspaceDir));
-      }
-
-      return tools;
-    }
-    case "standard": {
-      const tools: AgentTool[] = [
-        createReadTool(workspaceDir),
-        createWriteTool(workspaceDir),
-        createEditTool(workspaceDir),
-        createBashTool(workspaceDir),
-        createGlobTool(workspaceDir),
-        createGrepTool(workspaceDir),
-        ...createTaskTools(workspaceDir),
-        ...createGitTools(workspaceDir),
-        createNotebookEditTool(workspaceDir),
-        createLspTool(workspaceDir),
-      ];
-
-      // Add Agent tool if bus and globalConfig are provided
-      // Lazy-load to break circular dependency: agent/agent.ts imports this file
-      if (bus && globalConfig) {
-        const { createAgentTool } = await import("./agent.js");
-        tools.push(createAgentTool(bus, globalConfig, workspaceDir));
-      }
-
-      return tools;
-    }
+    case "full":
+      return ["read", "write", "edit", "bash", "glob", "web_search", "web_fetch", "mcp", "tool_search", "cron", "agent"];
+    case "standard":
+      return ["read", "write", "edit", "bash", "glob", "agent"];
     case "observe":
-      return [createReadTool(workspaceDir)];
+      return ["read"];
     case "bash":
-      return [createReadTool(workspaceDir), createBashTool(workspaceDir)];
+      return ["read", "bash"];
     case "none":
       return [];
     default:
-      return [
-        createReadTool(workspaceDir),
-        createWriteTool(workspaceDir),
-        createEditTool(workspaceDir),
-        createBashTool(workspaceDir),
-      ];
+      return ["read", "write", "edit", "bash"];
   }
+}
+
+// Tool name → factory registry. Each entry maps a config-level tool name
+// to a function that returns one or more AgentTool instances.
+// Coding-specific tools (grep, git, lsp, notebook_edit, tasks) are registered
+// so they remain available via explicit config but are no longer in any preset.
+
+async function _buildToolsFromNames(
+  names:        string[],
+  workspaceDir: string,
+  globalConfig?: GlobalConfig,
+  bus?:         EventBus,
+): Promise<AgentTool[]> {
+  const webSearchApiKey =
+    globalConfig?.skills?.entries?.["web-search"]?.apiKey ?? undefined;
+
+  const registry: Record<string, () => AgentTool | AgentTool[] | Promise<AgentTool | AgentTool[]>> = {
+    read:         () => createReadTool(workspaceDir),
+    write:        () => createWriteTool(workspaceDir),
+    edit:         () => createEditTool(workspaceDir),
+    bash:         () => createBashTool(workspaceDir),
+    glob:         () => createGlobTool(workspaceDir),
+    grep:         () => createGrepTool(workspaceDir),
+    web_search:   () => createWebSearchTool(webSearchApiKey ? { apiKey: webSearchApiKey } : {}),
+    web_fetch:    () => createWebFetchTool(),
+    mcp:          () => createMcpTools(),
+    tool_search:  () => createToolSearchTool(),
+    notebook_edit: () => createNotebookEditTool(workspaceDir),
+    lsp:          () => createLspTool(workspaceDir),
+    cron:         () => createCronTools(workspaceDir),
+    git:          () => createGitTools(workspaceDir),
+    tasks:        () => createTaskTools(workspaceDir),
+    agent:        async () => {
+      if (bus && globalConfig) {
+        const { createAgentTool } = await import("./agent.js");
+        return createAgentTool(bus, globalConfig, workspaceDir);
+      }
+      return [];
+    },
+  };
+
+  const results: AgentTool[] = [];
+  for (const name of names) {
+    const factory = registry[name];
+    if (factory) {
+      const result = await factory();
+      if (Array.isArray(result)) {
+        results.push(...result);
+      } else {
+        results.push(result);
+      }
+    }
+  }
+  return results;
+}
+
+export async function createCoreTools(
+  toolSet:      string | string[],
+  workspaceDir: string,
+  globalConfig?: GlobalConfig,
+  bus?:         EventBus,
+): Promise<AgentTool[]> {
+  const names = Array.isArray(toolSet) ? toolSet : _presetToolNames(toolSet);
+  return _buildToolsFromNames(names, workspaceDir, globalConfig, bus);
 }

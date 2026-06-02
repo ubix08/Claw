@@ -897,8 +897,11 @@ function _skillsFingerprint(globalConfig: GlobalConfig): string {
   });
 }
 
-function _toolSetNote(toolSet: string, customToolNames: string[] = []): string {
+function _toolSetNote(toolSet: import("../agent/types.js").AgentToolSet, customToolNames: string[] = []): string {
   const base = (() => {
+    if (Array.isArray(toolSet)) {
+      return `Available tools: ${toolSet.join(", ")}.`;
+    }
     switch (toolSet) {
       case "full":
       case "standard": return "Core file tools available: **read**, **write**, **edit**, **bash**.";
